@@ -426,14 +426,17 @@ def generate_bear_reply(user_msg: str, request: Request) -> str:
 
 @app.post("/chat")
 def chat(body: dict, request: Request):
+    # auth
     api_key_header = request.headers.get("X-Bear-Key")
     expected = os.getenv("DEVICE_API_KEY")
     if expected and api_key_header != expected:
         return {"reply": "I don't know this bear yet. Ask a grownup to connect me."}
 
-    user_msg = body.get("message") or ""
-    answer = generate_bear_reply(user_msg, request)
-    return {"reply": answer}
+    user_msg = (body.get("message") or "").strip()
+    # call the real logic
+    reply = generate_bear_reply(user_msg, request)
+    return {"reply": reply}
+
 
 @app.post("/chat-audio")
 def chat_audio(body: dict, request: Request):
