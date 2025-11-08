@@ -1,0 +1,24 @@
+[
+  {
+    "timestamp": "2025-11-07T20:55:22.124268",
+    "from": "child",
+    "text": "Hey bear buddy, where are you from?",
+    "topics": [
+      "paint a paper pumpkin using",
+      "will transfer a bowl of pumpkin",
+      "Letter O Wel-Dry-Try",
+      "paint a picture using autumn"
+    ]
+  },
+  {
+    "timestamp": "2025-11-07T20:55:22.125643",
+    "from": "bear",
+    "text": "Hi Kiera! I'm from a world made just for cuddles and fun times with friends like you. I\u2019m here to keep you company and join in your adventures! Where do you think I'm from?",
+    "topics": [
+      "paint a paper pumpkin using",
+      "will transfer a bowl of pumpkin",
+      "Letter O Wel-Dry-Try",
+      "paint a picture using autumn"
+    ]
+  }
+]

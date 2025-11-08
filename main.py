@@ -1,5 +1,6 @@
+cat > main.py <<'EOF'
 from fastapi import FastAPI, UploadFile, File, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 import requests
 import os
 import json
@@ -351,63 +352,58 @@ async def upload_plans(files: list[UploadFile] = File(...)):
     return {"status": "ok", "results": results}
 # ---------------------------------------------------
 
-
-@app.post("/chat")
-def chat(body: dict, request: Request):
+def generate_bear_reply(user_msg: str, request: Request) -> str:
+    # 1) auth
     api_key_header = request.headers.get("X-Bear-Key")
     expected = os.getenv("DEVICE_API_KEY")
     if expected and api_key_header != expected:
-        return {"reply": "I don't know this bear yet. Ask a grownup to connect me."}
-    # 1) load settings
+        return "I don't know this bear yet. Ask a grownup to connect me."
+
+    # 2) load settings
     settings = load_settings()
 
-    # 2) onboarding gate
+    # 3) onboarding gate
     if not settings.get("wifi_configured", False):
-        return {
-            "reply": "I still need to finish setup. Please finish connecting me first."
-        }
+        return "I still need to finish setup. Please finish connecting me first."
 
-    # 3) message from user
-    user_msg = (body.get("message") or "").strip()
+    # 4) message
+    user_msg = (user_msg or "").strip()
     if not user_msg:
-        return {"reply": "Can you say that again, honeybear?"}
+        return "Can you say that again, honeybear?"
 
-    # 4) profile: request overrides settings
-    profile = body.get("profile") or settings
+    # 5) profile
+    profile = settings
 
-        # --- NEW: update current_topic ---
+    # --- NEW: update current_topic ---
     current_topic = extract_topic(user_msg)
     if current_topic:
         settings["current_topic"] = current_topic
         save_settings(settings)
-    # ---------------------------------
+    # -------------------------------
 
-    # 5) curriculum?
+    # 6) curriculum
     curriculum_data = None
     if settings.get("use_curriculum", True):
         curriculum_data = load_curriculum_aggregate()
 
-    # 6) build system prompt
+    # 7) system prompt
     system_prompt = build_system_prompt(profile, curriculum_data)
 
-    # 7) build messages for Azure
+    # 8) call Azure OpenAI
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_msg},
     ]
-
     payload = {
         "messages": messages,
         "max_tokens": 250,
         "temperature": 0.7,
         "top_p": 0.95,
     }
-
     headers = {
         "Content-Type": "application/json",
-        "api-key": AZURE_OPENAI_KEY,   # already defined at top of your file
+        "api-key": AZURE_OPENAI_KEY,
     }
-
     url = (
         f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/"
         f"{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={API_VERSION}"
@@ -417,18 +413,112 @@ def chat(body: dict, request: Request):
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
         data = resp.json()
     except Exception as e:
-        # network / Azure unreachable
+        return f"Error calling Azure: {e}"
+
+    if "choices" not in data:
+        return f"Error from Azure: {data}"
+
+    answer = data["choices"][0]["message"]["content"]
+    # strip emojis for TTS
+    answer = answer.encode("ascii", errors="ignore").decode()
+    return answer
+
+
+@app.post("/chat")
+def chat(body: dict, request: Request):
+    api_key_header = request.headers.get("X-Bear-Key")
+    expected = os.getenv("DEVICE_API_KEY")
+    if expected and api_key_header != expected:
+        return {"reply": "I don't know this bear yet. Ask a grownup to connect me."}
+
+    user_msg = body.get("message") or ""
+    answer = generate_bear_reply(user_msg, request)
+    return {"reply": answer}
+
+@app.post("/chat-audio")
+def chat_audio(body: dict, request: Request):
+    # 1) re-use the same auth as /chat
+    api_key_header = request.headers.get("X-Bear-Key")
+    expected = os.getenv("DEVICE_API_KEY")
+    if expected and api_key_header != expected:
+        return {"reply": "I don't know this bear yet. Ask a grownup to connect me."}
+
+    # 2) load settings and make sure device is set up
+    settings = load_settings()
+    if not settings.get("wifi_configured", False):
+        return {"reply": "I still need to finish setup. Please finish connecting me first."}
+
+    user_msg = (body.get("message") or "").strip()
+    if not user_msg:
+        return {"reply": "Can you say that again, honeybear?"}
+
+    # 3) build prompt exactly like /chat does
+    profile = settings
+    curriculum_data = None
+    if settings.get("use_curriculum", True):
+        curriculum_data = load_curriculum_aggregate()
+
+    system_prompt = build_system_prompt(profile, curriculum_data)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
+    payload = {
+        "messages": messages,
+        "max_tokens": 250,
+        "temperature": 0.7,
+        "top_p": 0.95,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": AZURE_OPENAI_KEY,
+    }
+    url = (
+        f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/"
+        f"{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={API_VERSION}"
+    )
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        data = resp.json()
+    except Exception as e:
         return {"reply": f"Error calling Azure: {e}"}
 
     if "choices" not in data:
-        # Azure responded but not with a chat completion shape
         return {"reply": f"Error from Azure: {data}"}
 
-    answer = data["choices"][0]["message"]["content"]
-    # strip emojis / weird chars for TTS
-    answer = answer.encode("ascii", errors="ignore").decode()
+    reply = data["choices"][0]["message"]["content"]
+    reply = reply.encode("ascii", errors="ignore").decode()
 
-    return {"reply": answer}
+    # 4) now TTS in the cloud
+    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+        # speech not configured in Azure App Settings
+        return {"reply": reply, "note": "Speech not configured on server"}
+
+    tts_url = f"https://{AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+    ssml = f"""
+    <speak version='1.0' xml:lang='en-US'>
+      <voice name='en-US-AnaNeural'>{reply}</voice>
+    </speak>
+    """.strip()
+
+    tts_headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": "audio-16khz-32kbitrate-mono-mp3",
+    }
+
+    tts_resp = requests.post(tts_url, headers=tts_headers, data=ssml.encode("utf-8"))
+    if tts_resp.status_code != 200:
+        # fall back to text if voice fails
+        return {"reply": reply, "note": f"TTS failed: {tts_resp.status_code}"}
+
+    return StreamingResponse(
+        iter([tts_resp.content]),
+        media_type="audio/mpeg",
+        headers={"X-Bear-Reply": reply},
+    )
 
 # ---------- simple HTML GUI ----------
 @app.get("/ui", response_class=HTMLResponse)
@@ -568,3 +658,9 @@ def update_code():
         return {"status": "error", "output": e.output.decode()}
     except Exception as e:
         return {"status": "error", "output": str(e)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+EOF

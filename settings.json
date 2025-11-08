@@ -1,0 +1,11 @@
+{
+  "child_name": "Teddy",
+  "age_level": 4,
+  "focus_topics": [
+    "colors",
+    "bedtime"
+  ],
+  "voice_style": "toddler",
+  "use_curriculum": true,
+  "wifi_configured": true
+}
