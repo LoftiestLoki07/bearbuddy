@@ -1,177 +1,189 @@
+import os
+import sys
 import json
+import queue
 import time
 import requests
-import os
-
-from dotenv import load_dotenv   # NEW
-
-# ---- Vosk + mic ----
+import sounddevice as sd
 from vosk import Model, KaldiRecognizer
-import pyaudio
 
-# ---- Azure Speech (for real command + TTS) ----
+# ----- CONFIG -----
+# your local FastAPI brain
+BRAIN_URL = os.getenv("BEAR_BRAIN_URL", "http://127.0.0.1:8001/chat")
+DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "test123")
+
+# azure speech (tts)
 import azure.cognitiveservices.speech as speechsdk
 
-# ---------------- CONFIG ----------------
-VOSK_MODEL_PATH = r"C:\mini_ERP\vosk_model"  # change to your model path
-BEAR_API = "https://web-app-8367-bqbuhkdmb2fedwau.centralus-01.azurewebsites.net/chat"
+AZURE_SPEECH_KEY = os.getenv(
+    "AZURE_SPEECH_KEY",
+    "Ac0TlExZi97qWi2NAHNLra5oA2UUAcqkQ8LFc1TklGyR0gObvu8IJQQJ99BKACHYHv6XJ3w3AAAYACOGKS1t",
+)
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "eastus2")
+AZURE_VOICE = os.getenv("AZURE_VOICE", "en-US-AnaNeural")
+
+WAKEWORDS = ["bear", "hello bear", "hey bear"]
+WAKE_COOLDOWN_SEC = 4.0
+last_wake_time = 0.0
+
+MODEL_PATH = "vosk_model"
+SAMPLE_RATE = 16000
+# -------------------
 
 
-# load .env so AZURE_* and DEVICE_API_KEY work
-load_dotenv()
-
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
-DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "test123")  # <- same as backend
-# ----------------------------------------
-
-
-def init_azure_speech():
-    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-        raise ValueError("Missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION in .env")
-    print(f"Using Azure Speech in region: {AZURE_SPEECH_REGION}")
+def make_speech_synthesizer():
     speech_config = speechsdk.SpeechConfig(
-        subscription=AZURE_SPEECH_KEY,
-        region=AZURE_SPEECH_REGION
+        subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION
     )
-    speech_config.speech_synthesis_voice_name = "en-US-AnaNeural"
-    return speech_config
+    speech_config.speech_synthesis_voice_name = AZURE_VOICE
+    audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+    return speechsdk.SpeechSynthesizer(
+        speech_config=speech_config, audio_config=audio_config
+    )
 
 
-def tts(speech_config, text: str):
-    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
-    synthesizer.speak_text_async(text).get()
-
-
-def call_bear(text: str) -> str:
+def speak(text: str):
     try:
-        headers = {"X-Bear-Key": DEVICE_API_KEY}  # <-- IMPORTANT
-        r = requests.post(
-            BEAR_API,
-            json={"message": text},
-            headers=headers,
-            timeout=8
-        )
-        data = r.json()
-        return data.get("reply", "I didn't quite get that.")
+        synth = make_speech_synthesizer()
+        synth.speak_text_async(text).get()
     except Exception as e:
-        return f"I can't reach the bear brain right now. ({e})"
+        print(f"TTS error: {e}")
 
 
-def capture_with_azure(speech_config, timeout_sec=7):
-    """After wakeword, listen with Azure for the actual sentence."""
-    audio_config = speechsdk.AudioConfig(use_default_microphone=True)
-    recognizer = speechsdk.SpeechRecognizer(
-        speech_config=speech_config,
-        audio_config=audio_config
-    )
-
-    chunks = []
-
-    def on_recognized(evt):
-        if evt.result.text:
-            chunks.append(evt.result.text)
-
-    recognizer.recognized.connect(on_recognized)
-    recognizer.start_continuous_recognition()
-    print("BearBuddy: I'm listening...")
-
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        time.sleep(0.2)
-
-    recognizer.stop_continuous_recognition()
-    final_text = " ".join(chunks).strip()
-    print("Heard:", final_text)
-    return final_text
-
-
-def listen_for_wakeword(model_path: str):
-    """Block here until we hear 'bear', 'buddy bear', or 'kiera bear'."""
-    print("Wakeword: listening for 'bear' ...")
-
-    model = Model(model_path)
-
-    pa = pyaudio.PyAudio()
-    stream = pa.open(format=pyaudio.paInt16,
-                     channels=1,
-                     rate=16000,
-                     input=True,
-                     frames_per_buffer=8000)
-    stream.start_stream()
-
-    recognizer = KaldiRecognizer(model, 16000)
-
-    while True:
-        data = stream.read(4000, exception_on_overflow=False)
-        if len(data) == 0:
-            continue
-
-        if recognizer.AcceptWaveform(data):
-            result = recognizer.Result()
-            j = json.loads(result)
-            text = j.get("text", "").lower()
-            if text:
-                if ("bear" in text) or ("buddy bear" in text) or ("kiera bear" in text):
-                    print("Wakeword detected:", text)
-                    stream.stop_stream()
-                    stream.close()
-                    pa.terminate()
-                    return
+def call_bear_brain(user_text: str) -> str:
+    payload = {
+        "message": user_text,
+        "conversation_id": "home",  # just something stable for your device
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Bear-Key": DEVICE_API_KEY,
+    }
+    try:
+        resp = requests.post(
+            BRAIN_URL, headers=headers, data=json.dumps(payload), timeout=8
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("reply", "The bear didn't say anything.")
         else:
-            pass
+            print(f"brain HTTP {resp.status_code}: {resp.text}")
+            return "I couldn't reach the bear brain right now."
+    except Exception as e:
+        print(f"brain error: {e}")
+        return "I couldn't reach the bear brain right now."
 
 
-def capture_followup_with_azure(speech_config, timeout_sec=6):
-    """Short 'I'm still here' window after TTS."""
-    audio_config = speechsdk.AudioConfig(use_default_microphone=True)
-    recognizer = speechsdk.SpeechRecognizer(
-        speech_config=speech_config,
-        audio_config=audio_config
-    )
+def looks_like_wakeword(text: str) -> bool:
+    t = text.lower().strip()
+    if not t:
+        return False
 
-    parts = []
+    # exact matches
+    for w in WAKEWORDS:
+        if t == w:
+            return True
 
-    def on_recognized(evt):
-        if evt.result.text:
-            parts.append(evt.result.text)
+    # short phrases that include the word bear
+    if "bear" in t and len(t.split()) <= 4:
+        return True
 
-    recognizer.recognized.connect(on_recognized)
-    recognizer.start_continuous_recognition()
-    print("🐻 (still listening for a moment...)")
+    return False
 
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        time.sleep(0.2)
 
-    recognizer.stop_continuous_recognition()
-    return " ".join(parts).strip()
+def listen_for_one_utterance(model):
+    rec = KaldiRecognizer(model, SAMPLE_RATE)
+    rec.SetWords(True)
+
+    q2 = queue.Queue()
+
+    def cb(indata, frames, time_, status):
+        if status:
+            print(status, file=sys.stderr)
+        q2.put(bytes(indata))
+
+    print("Listening for user sentence...")
+    collected_text = ""
+    start_time = time.time()
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=8000,
+        dtype="int16",
+        channels=1,
+        callback=cb,
+    ):
+        while True:
+            if time.time() - start_time > 7:  # listen up to 7 seconds
+                break
+            try:
+                data = q2.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if rec.AcceptWaveform(data):
+                j = json.loads(rec.Result())
+                collected_text = j.get("text", "").strip()
+                break
+
+    return collected_text
 
 
 def main():
-    speech_config = init_azure_speech()
+    global last_wake_time
 
-    while True:
-        # 1. wait for wakeword
-        listen_for_wakeword(VOSK_MODEL_PATH)
+    if not os.path.isdir(MODEL_PATH):
+        print(f"Vosk model not found at {MODEL_PATH}")
+        sys.exit(1)
 
-        # 2. first user message (the main one)
-        user_text = capture_with_azure(speech_config, timeout_sec=7)
-        if not user_text:
-            continue
+    print(f"Using Azure Speech in region: {AZURE_SPEECH_REGION}")
+    print("Wakeword: listening for 'bear' ...")
 
-        reply = call_bear(user_text)
-        print("Bear:", reply)
-        tts(speech_config, reply)
+    model = Model(MODEL_PATH)
+    recognizer = KaldiRecognizer(model, SAMPLE_RATE)
+    recognizer.SetWords(True)
 
-        # 3. follow-up loop: keep listening until we get silence
+    q = queue.Queue()
+
+    def audio_callback(indata, frames, time_, status):
+        if status:
+            print(status, file=sys.stderr)
+        q.put(bytes(indata))
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=8000,
+        dtype="int16",
+        channels=1,
+        callback=audio_callback,
+    ):
         while True:
-            follow = capture_followup_with_azure(speech_config, timeout_sec=6)
-            if not follow:
-                break
-            reply2 = call_bear(follow)
-            print("Bear:", reply2)
-            tts(speech_config, reply2)
+            data = q.get()
+            if recognizer.AcceptWaveform(data):
+                result = recognizer.Result()
+                j = json.loads(result)
+                text = j.get("text", "").strip()
+                if not text:
+                    continue
+
+                if looks_like_wakeword(text):
+                    now = time.time()
+                    if now - last_wake_time < WAKE_COOLDOWN_SEC:
+                        continue
+                    last_wake_time = now
+
+                    print(f"Wakeword detected: {text}")
+                    speak("I'm listening...")
+                    print("BearBuddy: I'm listening...")
+
+                    user_text = listen_for_one_utterance(model)
+                    if user_text:
+                        print(f"Heard: {user_text}")
+                        reply = call_bear_brain(user_text)
+                        print(f"Bear: {reply}")
+                        speak(reply)
+                    else:
+                        print("Heard nothing.")
 
 
 if __name__ == "__main__":
